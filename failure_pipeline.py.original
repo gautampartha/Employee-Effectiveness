@@ -1,0 +1,168 @@
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+@st.cache_data
+def load_failures():
+    """
+    Load the failure log from css.csv, normalize System/SubSystem,
+    parse dates, filter for resolved failures (Status==2.0),
+    and cap Duration at 9999 for display (but keep original for filtering).
+    """
+    df = pd.read_csv('css.csv', on_bad_lines='skip', engine='python')
+
+    # Normalize System and SubSystem
+    df['System'] = df['System'].astype(str).str.strip().str.upper()
+    df['SubSystem'] = df['SubSystem'].astype(str).str.strip().str.upper()
+
+    # Parse Date column
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+    # Keep only resolved failures (Status == 2.0)
+    df = df[df['Status'] == 2.0].copy()
+
+    # Cap Duration at 9999 for display (but we'll keep original for filtering if needed)
+    df['Duration_capped'] = df['Duration'].clip(upper=9999)
+
+    return df
+
+@st.cache_data
+def load_pm_records():
+    """
+    Load PM records from pm_records_clean.csv and normalize station/system/subsystem.
+    """
+    df = pd.read_csv('pm_records_clean.csv')
+
+    # Normalize station, system, subsystem
+    df['station'] = df['station'].astype(str).str.strip().str.upper()
+    df['system'] = df['system'].astype(str).str.strip().str.upper()
+    df['subsystem'] = df['subsystem'].astype(str).str.strip().str.upper()
+
+    # Parse done_date
+    df['done_date'] = pd.to_datetime(df['done_date'], errors='coerce')
+
+    return df
+
+def classify_failures(failures_df, pm_df):
+    """
+    For each failure record, find the most recent PM record for the same
+    station+subsystem where done_date <= failure Date.
+
+    Returns failures_df with two new columns added:
+      - failure_label: "Maintenance Gap Failure", "Equipment Failure", or "No PM Record"
+      - last_pm_compliance: compliance_status of the most recent PM before this failure
+    """
+    # Work on a copy to avoid modifying the original
+    failures_df = failures_df.copy()
+    # Add a column to preserve original index (which may have gaps after filtering)
+    failures_df['_orig_idx'] = failures_df.index
+
+    # Prepare failures dataframe for merge_asof: we need station, subsystem, Date, and _orig_idx
+    failures_for_merge = failures_df[['Station', 'SubSystem', 'Date', '_orig_idx']].copy()
+    failures_for_merge = failures_for_merge.rename(
+        columns={'Station': 'station', 'SubSystem': 'subsystem', 'Date': 'failure_date'}
+    )
+    failures_for_merge = failures_for_merge.sort_values('failure_date')
+
+    # Prepare PM dataframe for merge_asof: we need station, subsystem, done_date, compliance_status, days_late
+    pm_for_merge = pm_df[['station', 'subsystem', 'done_date', 'compliance_status', 'days_late']].copy()
+    pm_for_merge = pm_for_merge.sort_values('done_date')
+
+    # Perform merge_asof on station+subsystem and done_date <= failure_date
+    merged = pd.merge_asof(
+        failures_for_merge,
+        pm_for_merge,
+        by=['station', 'subsystem'],
+        left_on='failure_date',
+        right_on='done_date',
+        direction='backward'
+    )
+
+    # Initialize new columns with default values
+    failures_df['failure_label'] = 'No PM Record'
+    failures_df['last_pm_compliance'] = None  # This sets dtype to object
+
+    # Identify rows where we found a PM record (i.e., done_date is not NaN)
+    has_pm = merged['done_date'].notna()
+    if has_pm.any():
+        # Get the original indices for rows with a PM match
+        idx_with_pm = merged.loc[has_pm, '_orig_idx']
+        # Get compliance_status and days_late for those rows
+        pm_compliance = merged.loc[has_pm, 'compliance_status']
+        pm_days_late = merged.loc[has_pm, 'days_late']
+
+        # Determine which are Maintenance Gap Failure: compliance_status == 'late' OR days_late > 3
+        maintenance_gap_condition = (pm_compliance == 'late') | (pm_days_late > 3)
+
+        # Assign failure_label based on condition
+        # Where condition is True -> Maintenance Gap Failure, else -> Equipment Failure
+        failure_label_values = np.where(
+            maintenance_gap_condition,
+            'Maintenance Gap Failure',
+            'Equipment Failure'
+        )
+        # Assign to the original dataframe using the original indices
+        failures_df.loc[idx_with_pm, 'failure_label'] = failure_label_values
+        # Assign last_pm_compliance
+        failures_df.loc[idx_with_pm, 'last_pm_compliance'] = pm_compliance.values
+
+    # Drop the helper column
+    failures_df = failures_df.drop(columns=['_orig_idx'])
+
+    return failures_df
+
+def get_failure_summary(classified_df):
+    """
+    Aggregate by station+subsystem to get summary statistics.
+
+    Returns a DataFrame with columns:
+      - Station
+      - SubSystem
+      - total_failures
+      - maintenance_gap_count
+      - maintenance_gap_pct
+      - equipment_failure_count
+      - equipment_failure_pct
+      - no_pm_record_count
+      - avg_resolution_minutes (mean Duration where Duration <= 9999)
+      - avg_resolution_hours (avg_resolution_minutes / 60)
+    """
+    # We'll work with a copy to avoid SettingWithCopyWarning
+    df = classified_df.copy()
+
+    # For average resolution time, we want to exclude Duration > 9999
+    valid_duration_mask = df['Duration'] <= 9999
+
+    # Group by station and subsystem
+    grouped = df.groupby(['Station', 'SubSystem'])
+
+    # Aggregate
+    summary = grouped.agg(
+        total_failures=('FailureCategory', 'size'),  # count of rows
+        maintenance_gap_count=('failure_label', lambda x: (x == 'Maintenance Gap Failure').sum()),
+        equipment_failure_count=('failure_label', lambda x: (x == 'Equipment Failure').sum()),
+        no_pm_record_count=('failure_label', lambda x: (x == 'No PM Record').sum()),
+        # For average resolution time, we take the mean of Duration where valid, else NaN
+        avg_resolution_minutes=('Duration', lambda x: x[valid_duration_mask.loc[x.index]].mean() if valid_duration_mask.loc[x.index].any() else None)
+    ).reset_index()
+
+    # Calculate percentages
+    total = summary['total_failures']
+    # Avoid division by zero
+    summary['maintenance_gap_pct'] = (summary['maintenance_gap_count'] / total * 100).fillna(0).round(1)
+    summary['equipment_failure_pct'] = (summary['equipment_failure_count'] / total * 100).fillna(0).round(1)
+
+    # Convert avg_resolution_minutes to hours and round to 1 decimal for display later
+    summary['avg_resolution_hours'] = (summary['avg_resolution_minutes'] / 60).round(1)
+
+    # Reorder columns for clarity
+    summary = summary[[
+        'Station', 'SubSystem',
+        'total_failures',
+        'maintenance_gap_count', 'maintenance_gap_pct',
+        'equipment_failure_count', 'equipment_failure_pct',
+        'no_pm_record_count',
+        'avg_resolution_minutes', 'avg_resolution_hours'
+    ]]
+
+    return summary
