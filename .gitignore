@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Local data / generated analysis artifacts
+css.csv
+pm_records_clean.csv
+pm_failure_*.csv
+dashboard-preview.png
+final-dashboard.png
+final-dashboard-2024-plus.png
