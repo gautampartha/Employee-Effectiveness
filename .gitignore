@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -137,3 +138,15 @@ Thumbs.db
 # Backup files
 *.bak
 *.backup
+=======
+__pycache__/
+*.pyc
+
+# Local data / generated analysis artifacts
+css.csv
+pm_records_clean.csv
+pm_failure_*.csv
+dashboard-preview.png
+final-dashboard.png
+final-dashboard-2024-plus.png
+>>>>>>> origin/main
