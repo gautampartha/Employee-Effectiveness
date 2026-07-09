@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
 import streamlit as st
-from pathlib import Path
+
+from app_config import BASE_DIR, ERROR_LOOKUP_PATH, FAILURE_LOG_PATH
 
 # --- Helper functions for normalization (based on teammate's version) ---
 def _normalize_text(value):
@@ -37,10 +38,6 @@ def load_failures():
     and cap Duration at 9999 for display (but keep original for filtering).
     """
     # Define paths
-    BASE_DIR = Path(__file__).resolve().parent
-    FAILURE_LOG_PATH = BASE_DIR / "css.csv"
-    ERROR_LOOKUP_PATH = BASE_DIR / "errors.csv"
-    
     # Check if files exist
     if not FAILURE_LOG_PATH.exists():
         raise FileNotFoundError(f"Failure log not found: {FAILURE_LOG_PATH}")

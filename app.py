@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pandas as pd
 import plotly.express as px
 import requests
@@ -8,20 +6,20 @@ import streamlit as st
 import failure_pipeline
 import insights_engine
 import pipeline
-
-
-COMPLIANCE_RED_THRESHOLD = 60.0
-COMPLIANCE_AMBER_THRESHOLD = 85.0
-
-COLOR_RED = "#d9534f"
-COLOR_AMBER = "#f0ad4e"
-COLOR_GREEN = "#2E7D32"
-
-BASE_DIR = Path(__file__).resolve().parent
-PM_RECORDS_PATH = BASE_DIR / "pm_records_clean.csv"
-PM_AGG_PATH = BASE_DIR / "pm_compliance_agg.csv"
-FAILURE_LOG_PATH = BASE_DIR / "css.csv"
-ERROR_LOOKUP_PATH = BASE_DIR / "errors.csv"
+from app_config import (
+    COLOR_AMBER,
+    COLOR_GREEN,
+    COLOR_RED,
+    COMPLIANCE_AMBER_THRESHOLD,
+    COMPLIANCE_RED_THRESHOLD,
+    ERROR_LOOKUP_PATH,
+    FAILURE_LOG_PATH,
+    MONTH_NAMES,
+    OLLAMA_MODEL,
+    OLLAMA_URL,
+    PM_AGG_PATH,
+    PM_RECORDS_PATH,
+)
 
 
 def get_compliance_color(pct):
@@ -174,9 +172,9 @@ CURRENT DATA SUMMARY:
 def ask_ollama(question, context):
     try:
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            OLLAMA_URL,
             json={
-                "model": "llama3.2:1b",
+                "model": OLLAMA_MODEL,
                 "prompt": f"{context}\n\nQuestion: {question}\n\nAnswer:",
                 "stream": False,
                 "options": {"temperature": 0.3, "num_predict": 300},

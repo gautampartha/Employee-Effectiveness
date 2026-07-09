@@ -2,23 +2,7 @@ import numpy as np
 import pandas as pd
 
 import pipeline
-
-
-MONTH_NAMES = [
-    "All",
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-]
+from app_config import MONTH_NAMES
 
 
 def _safe_pct(numerator, denominator):
