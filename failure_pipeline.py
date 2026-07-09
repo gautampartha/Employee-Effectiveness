@@ -142,7 +142,13 @@ def load_failures():
             "Log"
         ]
         
-        df = pd.read_csv(FAILURE_LOG_PATH, usecols=css_cols, on_bad_lines='skip', engine='python', dtype="string", low_memory=False)
+        df = pd.read_csv(
+            FAILURE_LOG_PATH,
+            usecols=css_cols,
+            on_bad_lines='skip',
+            engine='python',
+            dtype="string",
+        )
         
         # Load error lookup
         errors_df = pd.read_csv(
@@ -286,6 +292,9 @@ def load_failures():
     # Status may be numeric or string; convert to numeric for comparison
     df = df[pd.to_numeric(df['status'], errors='coerce') == 2.0].copy()
     
+    # Normalize duration once so all downstream comparisons/aggregations stay numeric.
+    df["duration_raw"] = pd.to_numeric(df["duration_raw"], errors="coerce")
+
     # Cap Duration at 9999 for display - ORIGINAL BEHAVIOR
     df['duration_capped'] = df['duration_raw'].clip(upper=9999)
     
@@ -296,7 +305,7 @@ def load_failures():
     df['Station'] = df['station']
     df['Date'] = df['failure_date']
     # Also restore the original Duration column for compatibility with app.py
-    df['Duration'] = df['duration_raw']
+    df['Duration'] = df['duration_capped']
     # Keep original column names from css.csv as well for compatibility
     # The user's code references columns like 'FailureDescription' - let's keep the originals
 
@@ -421,7 +430,7 @@ def get_failure_summary(classified_df):
 
     # Aggregate
     summary = grouped.agg(
-        total_failures=('sn', 'size'),  # count of rows
+        total_failures=('failure_label', 'size'),  # count of rows
         maintenance_gap_count=('failure_label', lambda x: (x == 'Maintenance Gap Failure').sum()),
         equipment_failure_count=('failure_label', lambda x: (x == 'Equipment Failure').sum()),
         no_pm_record_count=('failure_label', lambda x: (x == 'No PM Record').sum()),
