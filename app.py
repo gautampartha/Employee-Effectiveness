@@ -12,6 +12,7 @@ import data_source
 import failure_pipeline
 import insights_engine
 import pipeline
+import ui_components as ui
 from app_config import (
     COLOR_AMBER,
     COLOR_GREEN,
@@ -364,16 +365,7 @@ st.set_page_config(
     page_icon="🚇",
     layout="wide",
 )
-
-st.markdown(
-    """
-    <div style='background-color:#0A3A60; padding:20px; border-radius:10px; margin-bottom:25px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);'>
-        <h1 style='color:white; margin:0; font-family:sans-serif;'>Delhi Metro Rail Corporation</h1>
-        <h3 style='color:#A6D1FF; margin:5px 0 0 0; font-family:sans-serif; font-weight:normal;'>Employee Effectiveness System — PM Compliance and Failure Intelligence</h3>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+ui.inject_styles()
 
 try:
     records_df, agg_df, pm_date_range = load_core_data()
@@ -393,6 +385,8 @@ classified_failure_df = None
 failure_summary_df = pd.DataFrame()
 
 MONTH_NAMES = ["All", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+ui.render_header(active_source.label)
+applied_scope = ui.render_scope_bar(records_df, MONTH_NAMES)
 ASSISTANT_SESSION_VERSION = "ops_assistant_v5"
 
 if st.session_state.get("assistant_session_version") != ASSISTANT_SESSION_VERSION:
@@ -405,15 +399,40 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 
 with tab1:
-    st.subheader("Network-wide PM Snapshot")
-    st.info(generate_pm_insight_sentence(agg_df))
+    ui.render_workspace_title(
+        "Overview",
+        "Network health, PM compliance, and the areas that need attention first.",
+        "Operations snapshot",
+    )
+    scoped_agg = filter_agg_df(
+        agg_df,
+        station=applied_scope["station"],
+        system=applied_scope["system"],
+        subsystem=applied_scope["subsystem"],
+    )
+    scoped_records = (
+        pipeline.filter_records(
+            records_df,
+            station=applied_scope["station"],
+            system=applied_scope["system"],
+            subsystem=applied_scope["subsystem"],
+            year=applied_scope["year"],
+            month=applied_scope["month"],
+        )
+        if records_df is not None
+        else None
+    )
 
     network_kpis = (
-        pipeline.compute_compliance_summary(records_df)
-        if records_df is not None
-        else pipeline.compute_compliance_summary_from_agg(agg_df)
+        pipeline.compute_compliance_summary(scoped_records)
+        if scoped_records is not None
+        else pipeline.compute_compliance_summary_from_agg(scoped_agg)
     )
     comp_color = get_compliance_color(network_kpis["compliance_pct"])
+    st.markdown(
+        f"<div class='dmrc-priority'><strong>Operational focus:</strong> {html.escape(generate_pm_insight_sentence(scoped_agg))}</div>",
+        unsafe_allow_html=True,
+    )
 
     kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
     with kpi_col1:
@@ -425,15 +444,14 @@ with tab1:
     with kpi_col4:
         st.metric("Late PM Count", f"{network_kpis['late']:,}")
 
-    st.write("")
-    st.subheader("Compliance Performance Rankings")
+    ui.render_section("Where to intervene", "Rank the weakest PM performance pockets in the applied operating scope.")
     groupby_option = st.radio("Group Rankings By:", ["Subsystem", "Station"], horizontal=True, key="rank_groupby")
 
     group_cols = ["subsystem"] if groupby_option == "Subsystem" else ["station"]
     label_name = "Sub-System" if groupby_option == "Subsystem" else "Station Code"
 
     ranked_df = (
-        agg_df.groupby(group_cols, observed=True)
+        scoped_agg.groupby(group_cols, observed=True)
         .agg(total_pm=("total_pm", "sum"), on_time=("on_time", "sum"))
         .reset_index()
     )
@@ -462,12 +480,16 @@ with tab1:
         )
         fig_bar.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
         fig_bar.update_xaxes(range=[0, 110])
-        fig_bar.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=450)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        ui.style_chart(fig_bar, height=430)
+        st.plotly_chart(fig_bar, width="stretch")
 
 
 with tab2:
-    st.subheader("Detailed Intelligence")
+    ui.render_workspace_title(
+        "Detailed Intelligence",
+        "Investigate PM execution, recurring failures, and equipment history in the selected scope.",
+        "Investigation workspace",
+    )
 
     if records_df is None or not failure_files_available:
         st.info("Detailed intelligence needs both record-level PM data and failure data.")
@@ -478,22 +500,20 @@ with tab2:
                 f"{pm_date_range[0].date()} to {pm_date_range[1].date()}."
             )
 
-        st.caption("Pick a slice and click Generate. Heavy PM-failure analysis is loaded only on demand to keep startup fast.")
+        st.caption("The applied scope above controls this investigation. Failure analysis is still loaded only when requested.")
 
         with st.form("detailed_intelligence_form"):
-            f1, f2, f3, f4, f5 = st.columns(5)
+            f1, f2 = st.columns([2, 1])
             with f1:
-                station_val = st.selectbox("Station", ["All"] + sorted(records_df["station"].dropna().unique()), key="d_station")
-            with f2:
-                system_val = st.selectbox("System", ["All"] + sorted(records_df["system"].dropna().unique()), key="d_system")
-            with f3:
                 equipment_val = st.text_input("Equipment ID (optional)", key="d_equipment_text", placeholder="Paste exact equipment ID")
-            with f4:
-                years = ["All"] + sorted(records_df["done_date"].dt.year.dropna().astype(int).astype(str).unique())
-                year_val = st.selectbox("Year", years, key="d_year")
-            with f5:
-                month_val = st.selectbox("Month", MONTH_NAMES, key="d_month")
-            run_detailed = st.form_submit_button("Generate Detailed Intelligence", use_container_width=True)
+            with f2:
+                run_detailed = st.form_submit_button("Run investigation", type="primary", width="stretch")
+
+        station_val = applied_scope["station"]
+        system_val = applied_scope["system"]
+        subsystem_val = applied_scope["subsystem"]
+        year_val = applied_scope["year"]
+        month_val = applied_scope["month"]
 
         if not run_detailed:
             st.info("Choose filters and click `Generate Detailed Intelligence` to run the heavy PM-failure analysis for that slice.")
@@ -509,6 +529,7 @@ with tab2:
                 records_df,
                 station=station_val,
                 system=system_val,
+                subsystem=subsystem_val,
                 year=year_val,
                 month=month_val,
             )
@@ -516,6 +537,7 @@ with tab2:
                 failure_df,
                 station=station_val,
                 system=system_val,
+                subsystem=subsystem_val,
                 year=year_val,
                 month=month_val,
             )
@@ -544,6 +566,7 @@ with tab2:
                 failure_df,
                 station=station_val,
                 system=system_val,
+                subsystem=subsystem_val,
             )
             if equipment_val:
                 relation_df = pd.DataFrame()
@@ -560,6 +583,7 @@ with tab2:
                 failure_df,
                 station=station_val,
                 system=system_val,
+                subsystem=subsystem_val,
                 limit=200,
             )
             if equipment_val:
@@ -603,7 +627,7 @@ with tab2:
                         }
                     )
                     timeline_display = timeline_display.drop(columns=["owner", "secondary_owner"], errors="ignore")
-                    st.dataframe(timeline_display, use_container_width=True, hide_index=True)
+                    st.dataframe(timeline_display, width="stretch", hide_index=True)
 
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
@@ -621,8 +645,8 @@ with tab2:
                         title="Does Lower PM Compliance Come With More Failures?",
                         labels={"compliance_pct": "PM Compliance %", "failure_count": "Failure Count"},
                     )
-                    fig_relation.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=380)
-                    st.plotly_chart(fig_relation, use_container_width=True)
+                    ui.style_chart(fig_relation, height=360)
+                    st.plotly_chart(fig_relation, width="stretch")
 
             with chart_col2:
                 if linked_df.empty:
@@ -637,8 +661,8 @@ with tab2:
                         title="How Soon Failure Comes After PM",
                         labels={"days_to_next_failure": "Days from PM to Next Failure", "count": "Number of Cases"},
                     )
-                    fig_link.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=380)
-                    st.plotly_chart(fig_link, use_container_width=True)
+                    ui.style_chart(fig_link, height=360)
+                    st.plotly_chart(fig_link, width="stretch")
 
             chart_col3, chart_col4 = st.columns(2)
             with chart_col3:
@@ -656,8 +680,8 @@ with tab2:
                         color_continuous_scale="Blues",
                         title="Top Failure Modes in This Slice",
                     )
-                    fig_failures.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=380)
-                    st.plotly_chart(fig_failures, use_container_width=True)
+                    ui.style_chart(fig_failures, height=360)
+                    st.plotly_chart(fig_failures, width="stretch")
 
             with chart_col4:
                 if relation_df.empty:
@@ -678,8 +702,9 @@ with tab2:
                         title="Month-by-Month PM vs Failure Trend",
                         color_discrete_map={"compliance_pct": "#0A3A60", "failure_count": "#8B1E3F"},
                     )
-                    fig_month.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=380, hovermode="x unified")
-                    st.plotly_chart(fig_month, use_container_width=True)
+                    ui.style_chart(fig_month, height=360)
+                    fig_month.update_layout(hovermode="x unified")
+                    st.plotly_chart(fig_month, width="stretch")
 
             st.markdown("---")
             insight_parts = []
@@ -701,6 +726,7 @@ with tab2:
                 filtered_failure,
                 station=station_val,
                 system=system_val,
+                subsystem=subsystem_val,
                 limit=200,
             )
             if equipment_val:
@@ -723,14 +749,18 @@ with tab2:
                         "compliance_status": "PM Status",
                     }
                 )
-                st.dataframe(aligned_display, use_container_width=True, hide_index=True)
+                st.dataframe(aligned_display, width="stretch", hide_index=True)
 
 
 with tab3:
-    st.subheader("Failure Analysis Dashboard")
-    st.caption("This section classifies the full failure log against PM history, so it is loaded only when requested.")
+    ui.render_workspace_title(
+        "Failure Analysis",
+        "Classify failure patterns and surface locations that require preventive action.",
+        "Reliability workspace",
+    )
+    st.caption("This section classifies the full failure log against PM history and is loaded only when requested.")
 
-    load_failure_analysis = st.button("Load Failure Analysis", key="load_failure_analysis")
+    load_failure_analysis = st.button("Load failure analysis", key="load_failure_analysis", type="primary")
     if not load_failure_analysis:
         st.info("Click `Load Failure Analysis` to run the expensive failure classification flow.")
     else:
@@ -742,52 +772,19 @@ with tab3:
             classified_failure_df = None
 
     if classified_failure_df is not None and not classified_failure_df.empty:
-        f1, f2, f3, f4 = st.columns(4)
-        with f1:
-            failure_system = st.selectbox(
-                "System",
-                ["All"] + sorted(classified_failure_df["System"].dropna().unique()),
-                key="fa_system",
-            )
         filtered_classified = classified_failure_df
-        if failure_system != "All":
-            filtered_classified = filtered_classified[filtered_classified["System"] == failure_system]
-
-        with f2:
-            failure_subsystem = st.selectbox(
-                "Sub-System",
-                ["All"] + sorted(filtered_classified["SubSystem"].dropna().unique()),
-                key="fa_subsystem",
-            )
-        if failure_subsystem != "All":
-            filtered_classified = filtered_classified[filtered_classified["SubSystem"] == failure_subsystem]
-
-        with f3:
-            failure_station = st.selectbox(
-                "Station",
-                ["All"] + sorted(filtered_classified["Station"].dropna().unique()),
-                key="fa_station",
-            )
-        if failure_station != "All":
-            filtered_classified = filtered_classified[filtered_classified["Station"] == failure_station]
-
-        with f4:
-            date_min = filtered_classified["Date"].dropna().min()
-            date_max = filtered_classified["Date"].dropna().max()
-            if pd.notna(date_min) and pd.notna(date_max):
-                failure_dates = st.date_input(
-                    "Date Range",
-                    value=(date_min.date(), date_max.date()),
-                    min_value=date_min.date(),
-                    max_value=date_max.date(),
-                    key="fa_dates",
-                )
-                if len(failure_dates) == 2:
-                    start_date, end_date = failure_dates
-                    filtered_classified = filtered_classified[
-                        (filtered_classified["Date"].dt.date >= start_date)
-                        & (filtered_classified["Date"].dt.date <= end_date)
-                    ]
+        if applied_scope["system"] != "All":
+            filtered_classified = filtered_classified[filtered_classified["System"] == applied_scope["system"]]
+        if applied_scope["subsystem"] != "All":
+            filtered_classified = filtered_classified[filtered_classified["SubSystem"] == applied_scope["subsystem"]]
+        if applied_scope["station"] != "All":
+            filtered_classified = filtered_classified[filtered_classified["Station"] == applied_scope["station"]]
+        if applied_scope["year"] != "All":
+            filtered_classified = filtered_classified[filtered_classified["Date"].dt.year == int(applied_scope["year"])]
+        if applied_scope["month"] != "All":
+            filtered_classified = filtered_classified[
+                filtered_classified["Date"].dt.month == MONTH_NAMES.index(applied_scope["month"])
+            ]
 
         if filtered_classified.empty:
             st.warning("No failure records match the selected filters.")
@@ -823,7 +820,8 @@ with tab3:
                     },
                     title="Failure Classification Breakdown",
                 )
-                st.plotly_chart(fig_pie, use_container_width=True)
+                ui.style_chart(fig_pie, height=360)
+                st.plotly_chart(fig_pie, width="stretch")
 
             with c2:
                 station_stats = (
@@ -844,7 +842,8 @@ with tab3:
                     color_continuous_scale="OrRd",
                 )
                 fig_station.update_traces(textposition="outside")
-                st.plotly_chart(fig_station, use_container_width=True)
+                ui.style_chart(fig_station, height=360)
+                st.plotly_chart(fig_station, width="stretch")
 
             subsystem_stats = (
                 filtered_classified.groupby("SubSystem")
@@ -861,14 +860,12 @@ with tab3:
             subsystem_stats["eq_pct"] = (subsystem_stats["eq_count"] / subsystem_stats["total_failures"] * 100).round(1)
             subsystem_stats["npm_pct"] = (subsystem_stats["npm_count"] / subsystem_stats["total_failures"] * 100).round(1)
 
-            st.markdown("**Subsystem Failure Frequency**")
-            st.dataframe(
-                subsystem_stats[
-                    ["SubSystem", "total_failures", "mg_pct", "eq_pct", "npm_pct"]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
+            with st.expander("View subsystem failure frequency", expanded=False):
+                st.dataframe(
+                    subsystem_stats[["SubSystem", "total_failures", "mg_pct", "eq_pct", "npm_pct"]],
+                    width="stretch",
+                    hide_index=True,
+                )
 
             trend_df = filtered_classified.copy()
             trend_df["Month"] = trend_df["Date"].dt.to_period("M").astype(str)
@@ -886,11 +883,16 @@ with tab3:
                 },
                 title="Monthly Failure Trend",
             )
-            st.plotly_chart(fig_trend, use_container_width=True)
+            ui.style_chart(fig_trend, height=360)
+            st.plotly_chart(fig_trend, width="stretch")
 
 
 with tab4:
-    st.subheader("Ask Assistant")
+    ui.render_workspace_title(
+        "Ask Assistant",
+        "Ask a focused operational question with answers grounded in dashboard calculations.",
+        "Verified operations assistant",
+    )
     st.caption(
         f"DMRC OpsAssistant: intent checked first, verified app calculations second, local Ollama `{OLLAMA_MODEL}` only for wording."
     )
@@ -898,7 +900,7 @@ with tab4:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    if st.button("Clear Chat", key="assistant_clear"):
+    if st.button("Clear conversation", key="assistant_clear"):
         st.session_state.chat_history = []
         st.rerun()
 
@@ -913,7 +915,7 @@ with tab4:
                     if chat.get("data_used"):
                         st.caption(f"Data used: {chat['data_used']}")
 
-    st.caption("Try: Which stations need urgent attention? | What percentage of failures are maintenance gaps? | Show failures for CCTV")
+    st.caption("Try: Which stations need urgent attention? · What percentage of failures are maintenance gaps? · Show failures for CCTV")
     user_question = st.chat_input("Ask about DMRC maintenance performance")
 
     if user_question and user_question.strip():
@@ -921,6 +923,33 @@ with tab4:
         with st.spinner("Thinking..."):
             question_upper = user_question.upper()
             failure_df = load_failure_data(pm_date_range) if failure_files_available else None
+            chat_records = (
+                pipeline.filter_records(
+                    records_df,
+                    station=applied_scope["station"],
+                    system=applied_scope["system"],
+                    subsystem=applied_scope["subsystem"],
+                    year=applied_scope["year"],
+                    month=applied_scope["month"],
+                )
+                if records_df is not None
+                else None
+            )
+            chat_agg = filter_agg_df(
+                agg_df,
+                station=applied_scope["station"],
+                system=applied_scope["system"],
+                subsystem=applied_scope["subsystem"],
+            )
+            if failure_df is not None:
+                failure_df = pipeline.filter_failure_events(
+                    failure_df,
+                    station=applied_scope["station"],
+                    system=applied_scope["system"],
+                    subsystem=applied_scope["subsystem"],
+                    year=applied_scope["year"],
+                    month=applied_scope["month"],
+                )
             classified_for_chat = None
             if any(term in question_upper for term in ["MAINTENANCE GAP", "GAP FAILURE", "EQUIPMENT FAILURE", "CLASSIFIED FAILURE", "NO PM RECORD"]):
                 try:
@@ -929,8 +958,8 @@ with tab4:
                     st.warning(f"Maintenance-gap classification could not be loaded: {exc}")
             answer_result = pipeline.answer_operations_question(
                 user_question,
-                records_df,
-                agg_df,
+                chat_records,
+                chat_agg,
                 failure_df,
                 classified_df=classified_for_chat,
                 chat_history=st.session_state.chat_history[-12:],
@@ -972,48 +1001,18 @@ with tab4:
 
 
 with tab5:
-    st.subheader("Intelligent Maintenance Decision Support")
-    st.caption("Choose a scope to rank subsystem risk, expose predictive trends, and generate data-grounded actions.")
-
-    insight_station_options = ["All"]
-    insight_system_options = ["All"]
-    insight_subsystem_options = ["All"]
-    insight_year_options = ["All"]
-
-    if records_df is not None and not records_df.empty:
-        insight_station_options += sorted(records_df["station"].dropna().unique())
-        insight_system_options += sorted(records_df["system"].dropna().unique())
-        insight_year_options += sorted(records_df["done_date"].dt.year.dropna().astype(int).astype(str).unique())
-        if "i_station" not in st.session_state:
-            st.session_state.i_station = "All"
-        if "i_system" not in st.session_state:
-            st.session_state.i_system = "All"
-        if "i_subsystem" not in st.session_state:
-            st.session_state.i_subsystem = "All"
-
-        current_station = st.session_state.i_station
-        current_system = st.session_state.i_system
-
-        scoped_for_subsystems = records_df
-        if current_station != "All":
-            scoped_for_subsystems = scoped_for_subsystems[scoped_for_subsystems["station"] == current_station]
-        if current_system != "All":
-            scoped_for_subsystems = scoped_for_subsystems[scoped_for_subsystems["system"] == current_system]
-        insight_subsystem_options += sorted(scoped_for_subsystems["subsystem"].dropna().unique())
-
-    with st.form("insights_slice_form"):
-        fi1, fi2, fi3, fi4, fi5 = st.columns(5)
-        with fi1:
-            insight_station = st.selectbox("Station", insight_station_options, key="i_station")
-        with fi2:
-            insight_system = st.selectbox("System", insight_system_options, key="i_system")
-        with fi3:
-            insight_subsystem = st.selectbox("Sub-System", insight_subsystem_options, key="i_subsystem")
-        with fi4:
-            insight_year = st.selectbox("Year", insight_year_options, key="i_year")
-        with fi5:
-            insight_month = st.selectbox("Month", MONTH_NAMES, key="i_month")
-        generate_slice_insights = st.form_submit_button("Generate Slice Insights", use_container_width=True)
+    ui.render_workspace_title(
+        "Insights",
+        "Rank subsystem risk and turn the applied operating scope into data-grounded actions.",
+        "Decision support",
+    )
+    st.caption("Use the shared scope above, then generate the current decision brief on demand.")
+    insight_station = applied_scope["station"]
+    insight_system = applied_scope["system"]
+    insight_subsystem = applied_scope["subsystem"]
+    insight_year = applied_scope["year"]
+    insight_month = applied_scope["month"]
+    generate_slice_insights = st.button("Generate decision brief", key="generate_slice_insights", type="primary")
 
     if generate_slice_insights:
         with st.spinner("Loading slice data and preparing insights..."):
@@ -1094,11 +1093,11 @@ with tab5:
             generate_ai_brief = st.button(
                 "Generate AI Brief",
                 key="insight_ai_brief",
-                use_container_width=True,
+                width="stretch",
             )
         with graph_button_col:
             graph_button_label = "Hide All Graphs" if st.session_state.show_insights_graph else "Show All Graphs"
-            if st.button(graph_button_label, key="toggle_insights_graph", use_container_width=True):
+            if st.button(graph_button_label, key="toggle_insights_graph", width="stretch"):
                 st.session_state.show_insights_graph = not st.session_state.show_insights_graph
                 st.rerun()
 
@@ -1203,6 +1202,7 @@ with tab5:
                             markers=True,
                             height=110,
                         )
+                        ui.style_chart(sparkline_figure, height=145)
                         sparkline_figure.update_layout(
                             showlegend=False,
                             xaxis_title=None,
@@ -1211,7 +1211,7 @@ with tab5:
                         )
                         st.plotly_chart(
                             sparkline_figure,
-                            use_container_width=True,
+                            width="stretch",
                             key=f"insight_sparkline_{insight_index}",
                         )
 
@@ -1259,13 +1259,11 @@ with tab5:
                                 hover_data={"Weight": ":.1%", "Factor score": ":.1f"},
                                 height=240,
                             )
-                            breakdown_figure.update_layout(
-                                coloraxis_showscale=False,
-                                margin=dict(l=10, r=10, t=10, b=10),
-                            )
+                            ui.style_chart(breakdown_figure, height=240)
+                            breakdown_figure.update_layout(coloraxis_showscale=False)
                             st.plotly_chart(
                                 breakdown_figure,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"insights_risk_breakdown_{chart_index}",
                             )
 
@@ -1320,9 +1318,10 @@ with tab5:
                     line_color="#777777",
                     annotation_text="Median failure rate",
                 )
-                risk_figure.update_layout(legend_title_text="Risk tier", margin=dict(l=20, r=20, t=30, b=20))
+                ui.style_chart(risk_figure, height=430)
+                risk_figure.update_layout(legend_title_text="Risk tier")
                 st.plotly_chart(
                     risk_figure,
-                    use_container_width=True,
+                    width="stretch",
                     key="insights_subsystem_risk_matrix",
                 )

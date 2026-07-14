@@ -1,0 +1,7 @@
+"id","PM_Schedule_Name","Interval_In_Days"
+"1","MONTHLY","30"
+"2","WEEKLY","7"
+"3","YEARLY","365"
+"4","QUARTERLY","90"
+"5","BI-WEEKLY","14"
+"6","HALF YEARLY","180"

@@ -255,9 +255,18 @@ def load_failures():
         # Calculate mapping confidence (simplified version)
         df["mapping_confidence"] = "LOOKUP_ONLY"
         exact_match = df["subsystem"] == df["mapped_eqp_type_norm"]
-        family_match = (
-            df["subsystem"].fillna("").str.contains(df["mapped_eqp_type_norm"].fillna(""), regex=False)
-            | df["mapped_eqp_type_norm"].fillna("").str.contains(df["subsystem"].fillna(""), regex=False)
+        # Empty lookup values must not count as a family match: every string
+        # contains an empty string, which otherwise overstates confidence for
+        # unmapped failure codes.
+        family_match = pd.Series(
+            [
+                bool(subsystem and mapped_type and (mapped_type in subsystem or subsystem in mapped_type))
+                for subsystem, mapped_type in zip(
+                    df["subsystem"].fillna(""),
+                    df["mapped_eqp_type_norm"].fillna(""),
+                )
+            ],
+            index=df.index,
         )
         system_level_match = (
             ((df["mapped_eqp_type_norm"] == "ALL AFC") & (df["system"] == "AFC"))
@@ -379,7 +388,12 @@ def classify_failures(failures_df, pm_df):
         pm_days_late = merged.loc[has_pm, 'days_late']
 
         # Determine which are Maintenance Gap Failure: compliance_status == 'late' OR days_late > 3
-        maintenance_gap_condition = (pm_compliance == 'late') | (pm_days_late > 3)
+        # PM files may contain either `late` or `LATE`; normalize before
+        # classifying so status casing cannot change the failure label.
+        maintenance_gap_condition = (
+            pm_compliance.astype("string").str.upper().eq("LATE")
+            | (pd.to_numeric(pm_days_late, errors="coerce") > 3)
+        )
 
         # Assign failure_label based on condition
         # Where condition is True -> Maintenance Gap Failure, else -> Equipment Failure
