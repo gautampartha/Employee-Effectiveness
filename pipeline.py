@@ -1,7 +1,11 @@
 from pathlib import Path
+import difflib
+import re
 
 import numpy as np
 import pandas as pd
+
+from intent_classifier import classify_intent, security_filter
 
 
 NULL_TOKENS = {"", "NULL", "NAN", "NONE", "NA", "N/A"}
@@ -719,59 +723,704 @@ def build_equipment_pm_failure_links(records_df, failure_df, station=None, syste
     return linked_df
 
 
-def answer_operations_question(question, records_df, failure_df):
-    """
-    Lightweight rule-based assistant for operational count questions.
-    """
-    q = (question or "").strip()
-    if not q:
-        return "Ask something like: how many failures were there at RJBH, what is the PM compliance for AFC GATE, or which subsystem has the most failures."
+def _safe_pct(numerator, denominator):
+    return round(float(numerator) / float(denominator) * 100, 1) if denominator else 0.0
 
-    q_norm = q.upper()
-    pm_df = records_df if records_df is not None else pd.DataFrame()
-    fail_df = failure_df if failure_df is not None else pd.DataFrame()
+
+def _extract_question_scope(question_text, pm_df, fail_df):
+    q_norm = question_text.upper()
 
     def extract_value(values):
-        for value in sorted([v for v in values if pd.notna(v)], key=len, reverse=True):
-            if str(value) in q_norm:
-                return str(value)
+        cleaned = [str(v).upper() for v in values if pd.notna(v)]
+        for value in sorted(set(cleaned), key=len, reverse=True):
+            pattern = rf"(?<![A-Z0-9]){re.escape(value)}(?![A-Z0-9])"
+            if value and re.search(pattern, q_norm):
+                return value
         return None
 
-    station = extract_value(set(pm_df.get("station", pd.Series(dtype="string")).dropna().unique()) | set(fail_df.get("station", pd.Series(dtype="string")).dropna().unique()))
-    section = extract_value(set(pm_df.get("section", pd.Series(dtype="string")).dropna().unique()) | set(fail_df.get("section", pd.Series(dtype="string")).dropna().unique()))
-    system = extract_value(set(pm_df.get("system", pd.Series(dtype="string")).dropna().unique()) | set(fail_df.get("system", pd.Series(dtype="string")).dropna().unique()))
-    subsystem = extract_value(set(pm_df.get("subsystem", pd.Series(dtype="string")).dropna().unique()) | set(fail_df.get("subsystem", pd.Series(dtype="string")).dropna().unique()))
+    scope = {}
+    for col in ["station", "section", "system", "subsystem"]:
+        pm_values = pm_df[col].dropna().unique() if col in pm_df.columns else []
+        fail_values = fail_df[col].dropna().unique() if col in fail_df.columns else []
+        scope[col] = extract_value(set(pm_values) | set(fail_values))
+    return scope
 
-    scoped_pm = pm_df
-    scoped_fail = fail_df
-    for col, value in [("station", station), ("section", section), ("system", system), ("subsystem", subsystem)]:
-        if value and col in scoped_pm.columns:
-            scoped_pm = scoped_pm[scoped_pm[col] == value]
-        if value and col in scoped_fail.columns:
-            scoped_fail = scoped_fail[scoped_fail[col] == value]
 
-    if "HOW MANY FAIL" in q_norm or "NUMBER OF FAIL" in q_norm or "FAILURES" in q_norm:
-        return f"There were {len(scoped_fail):,} failures in the requested scope."
+def _apply_scope(df, scope, column_map=None):
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    if "HOW MANY PM" in q_norm or "NUMBER OF PM" in q_norm or "PM ACTION" in q_norm:
-        pm_summary = compute_compliance_summary(scoped_pm) if not scoped_pm.empty else {"total_pm": 0}
-        return f"There were {pm_summary['total_pm']:,} trackable PM actions in the requested scope."
+    filtered_df = df
+    column_map = column_map or {}
+    for key, value in scope.items():
+        col = column_map.get(key, key)
+        if value and col in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df[col].astype("string").str.upper() == value]
+    return filtered_df
 
-    if "COMPLIANCE" in q_norm:
-        pm_summary = compute_compliance_summary(scoped_pm) if not scoped_pm.empty else {"compliance_pct": 0.0, "total_pm": 0}
-        return f"PM compliance is {pm_summary['compliance_pct']:.1f}% across {pm_summary['total_pm']:,} trackable PM actions in the requested scope."
 
-    if "TOP FAILURE" in q_norm or "MOST FAILURE" in q_norm:
+def _scope_label(scope):
+    parts = []
+    for label in ["station", "section", "system", "subsystem"]:
+        if scope.get(label):
+            parts.append(f"{label} {scope[label]}")
+    return ", ".join(parts) if parts else "the full network"
+
+
+def _pm_compliance_by_group(pm_df, group_col, min_pm=20):
+    if pm_df is None or pm_df.empty or group_col not in pm_df.columns:
+        return pd.DataFrame()
+
+    trackable_df = pm_df[pm_df["compliance_status"] != "BASELINE"].copy()
+    if trackable_df.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        trackable_df.groupby(group_col, observed=True)
+        .agg(
+            total_pm=("compliance_status", "size"),
+            on_time=("compliance_status", lambda x: int((x == "ON_TIME").sum())),
+            late=("compliance_status", lambda x: int((x == "LATE").sum())),
+            avg_days_late=("days_late", "mean"),
+        )
+        .reset_index()
+    )
+    grouped = grouped[grouped["total_pm"] >= min_pm].copy()
+    if grouped.empty:
+        return grouped
+
+    grouped["compliance_pct"] = grouped.apply(
+        lambda row: _safe_pct(row["on_time"], row["total_pm"]),
+        axis=1,
+    )
+    grouped["avg_days_late"] = grouped["avg_days_late"].fillna(0).round(1)
+    return grouped
+
+
+def _failure_by_group(fail_df, group_col):
+    if fail_df is None or fail_df.empty or group_col not in fail_df.columns:
+        return pd.DataFrame(columns=[group_col, "total_failures", "unresolved", "avg_resolution_hours", "unique_assets"])
+
+    agg_spec = {"total_failures": ("status", "size")}
+    if "resolved" in fail_df.columns:
+        agg_spec["resolved"] = ("resolved", "sum")
+    if "resolution_hours" in fail_df.columns:
+        agg_spec["avg_resolution_hours"] = ("resolution_hours", "mean")
+    if "equipment_no" in fail_df.columns:
+        agg_spec["unique_assets"] = ("equipment_no", "nunique")
+
+    grouped = fail_df.groupby(group_col, observed=True).agg(**agg_spec).reset_index()
+    if "resolved" in grouped.columns:
+        grouped["unresolved"] = grouped["total_failures"] - grouped["resolved"]
+    else:
+        grouped["unresolved"] = 0
+    if "avg_resolution_hours" not in grouped.columns:
+        grouped["avg_resolution_hours"] = 0.0
+    if "unique_assets" not in grouped.columns:
+        grouped["unique_assets"] = 0
+    grouped["avg_resolution_hours"] = grouped["avg_resolution_hours"].fillna(0).round(1)
+    return grouped[[group_col, "total_failures", "unresolved", "avg_resolution_hours", "unique_assets"]]
+
+
+def _format_ranked_rows(df, label_col, fields, limit=5):
+    lines = []
+    for idx, row in df.head(limit).iterrows():
+        details = ", ".join(field(row) for field in fields)
+        lines.append(f"{idx + 1}. {row[label_col]}: {details}")
+    return "\n".join(lines)
+
+
+def _safe_person_label(value):
+    text = str(value).strip()
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 5:
+        return f"Employee ID ending {digits[-4:]}"
+    return " ".join(part.capitalize() for part in text.split())
+
+
+def _employee_key(value):
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _employee_display_name(series):
+    labels = series.dropna().astype(str).str.strip()
+    if labels.empty:
+        return "Unassigned"
+    return _safe_person_label(labels.mode().iloc[0])
+
+
+def _find_employee_match(question_text, employee_keys):
+    stop_words = {
+        "how",
+        "many",
+        "late",
+        "pm",
+        "pms",
+        "employee",
+        "best",
+        "worst",
+        "have",
+        "has",
+        "is",
+        "the",
+        "for",
+        "show",
+        "tell",
+        "me",
+        "performance",
+        "effectiveness",
+    }
+    query_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", (question_text or "").lower())
+        if token not in stop_words and len(token) >= 2
+    }
+    if not query_tokens:
+        return None
+
+    best_key = None
+    best_overlap = 0
+    for key in employee_keys:
+        key_tokens = set(str(key).split())
+        overlap = len(query_tokens & key_tokens)
+        if overlap > best_overlap and overlap >= min(2, len(query_tokens)):
+            best_key = key
+            best_overlap = overlap
+    return best_key
+
+
+def _urgent_station_answer(pm_df, fail_df):
+    pm_station = _pm_compliance_by_group(pm_df, "station", min_pm=20)
+    fail_station = _failure_by_group(fail_df, "station")
+
+    if pm_station.empty and fail_station.empty:
+        return "I do not have enough station-level PM or failure data loaded to rank urgent stations."
+
+    station_health = pm_station.merge(fail_station, on="station", how="outer").fillna(
+        {
+            "total_pm": 0,
+            "on_time": 0,
+            "late": 0,
+            "avg_days_late": 0,
+            "compliance_pct": 100,
+            "total_failures": 0,
+            "unresolved": 0,
+            "avg_resolution_hours": 0,
+            "unique_assets": 0,
+        }
+    )
+    for col in ["total_pm", "on_time", "late", "total_failures", "unresolved", "unique_assets"]:
+        station_health[col] = station_health[col].astype(int)
+
+    max_failures = max(float(station_health["total_failures"].max()), 1.0)
+    max_unresolved = max(float(station_health["unresolved"].max()), 1.0)
+    max_resolution = max(float(station_health["avg_resolution_hours"].max()), 1.0)
+    station_health["risk_score"] = (
+        (100 - station_health["compliance_pct"].clip(upper=100)) * 0.45
+        + (station_health["total_failures"] / max_failures * 35)
+        + (station_health["unresolved"] / max_unresolved * 10)
+        + (station_health["avg_resolution_hours"] / max_resolution * 10)
+    ).round(1)
+    station_health = station_health.sort_values(
+        ["risk_score", "total_failures", "late"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    lines = _format_ranked_rows(
+        station_health,
+        "station",
+        [
+            lambda r: f"risk {r['risk_score']:.1f}",
+            lambda r: f"PM compliance {r['compliance_pct']:.1f}% across {int(r['total_pm']):,} PMs",
+            lambda r: f"{int(r['late']):,} late PMs",
+            lambda r: f"{int(r['total_failures']):,} failures",
+        ],
+    )
+    return (
+        "Stations needing urgent attention, ranked by low PM compliance plus failure pressure:\n"
+        f"{lines}\n\nRecommended action: start with the first station, then drill into its weakest subsystem and repeated equipment IDs before assigning recovery work."
+    )
+
+
+def _worst_compliance_answer(pm_df, group_col, scope):
+    scoped_pm = _apply_scope(pm_df, scope)
+    ranked = _pm_compliance_by_group(scoped_pm, group_col, min_pm=20)
+    if ranked.empty:
+        return f"I do not have enough PM records to rank {group_col} compliance for {_scope_label(scope)}."
+
+    ranked = ranked.sort_values(["compliance_pct", "late"], ascending=[True, False]).reset_index(drop=True)
+    lines = _format_ranked_rows(
+        ranked,
+        group_col,
+        [
+            lambda r: f"{r['compliance_pct']:.1f}% compliance",
+            lambda r: f"{int(r['late']):,} late out of {int(r['total_pm']):,} PMs",
+            lambda r: f"average delay {r['avg_days_late']:.1f} days",
+        ],
+    )
+    return f"Worst PM compliance by {group_col} for {_scope_label(scope)}:\n{lines}"
+
+
+def _failure_hotspot_answer(fail_df, group_col, scope):
+    scoped_fail = _apply_scope(fail_df, scope)
+    ranked = _failure_by_group(scoped_fail, group_col)
+    if ranked.empty:
+        return f"No failure records were found for {_scope_label(scope)}."
+
+    ranked = ranked.sort_values(["total_failures", "avg_resolution_hours"], ascending=[False, False]).reset_index(drop=True)
+    lines = _format_ranked_rows(
+        ranked,
+        group_col,
+        [
+            lambda r: f"{int(r['total_failures']):,} failures",
+            lambda r: f"{int(r['unique_assets']):,} affected assets",
+            lambda r: f"avg resolution {r['avg_resolution_hours']:.1f} hours",
+        ],
+    )
+    return f"Failure hotspots by {group_col} for {_scope_label(scope)}:\n{lines}"
+
+
+def _maintenance_gap_answer(classified_failure_df, scope):
+    if classified_failure_df is None or classified_failure_df.empty:
+        return (
+            "Maintenance-gap classification is not loaded yet. Open or run the Failure Analysis data once, "
+            "then I can calculate maintenance-gap versus equipment-side failures accurately."
+        )
+
+    scoped = _apply_scope(
+        classified_failure_df,
+        scope,
+        column_map={"station": "Station", "system": "System", "subsystem": "SubSystem"},
+    )
+    if scoped.empty or "failure_label" not in scoped.columns:
+        return f"No classified failure records were found for {_scope_label(scope)}."
+
+    total = len(scoped)
+    gap = int((scoped["failure_label"] == "Maintenance Gap Failure").sum())
+    equipment = int((scoped["failure_label"] == "Equipment Failure").sum())
+    no_pm = int((scoped["failure_label"] == "No PM Record").sum())
+    return (
+        f"For {_scope_label(scope)}, {gap:,} of {total:,} classified failures are maintenance-gap failures "
+        f"({_safe_pct(gap, total):.1f}%). Equipment-side failures are {equipment:,} "
+        f"({_safe_pct(equipment, total):.1f}%), and {no_pm:,} failures have no prior PM record "
+        f"({_safe_pct(no_pm, total):.1f}%)."
+    )
+
+
+def _employee_effectiveness_answer(pm_df, scope, question_text=None):
+    scoped_pm = _apply_scope(pm_df, scope)
+    if scoped_pm.empty or "done_by" not in scoped_pm.columns:
+        return f"I do not have employee-level PM completion data for {_scope_label(scope)}."
+
+    trackable = scoped_pm[(scoped_pm["compliance_status"] != "BASELINE") & scoped_pm["done_by"].notna()].copy()
+    trackable = trackable[trackable["done_by"].astype(str).str.upper() != "UNASSIGNED"]
+    if trackable.empty:
+        return f"No named employee PM records were found for {_scope_label(scope)}."
+
+    trackable["employee_key"] = trackable["done_by"].map(_employee_key)
+    trackable = trackable[trackable["employee_key"] != ""]
+    if trackable.empty:
+        return f"No named employee PM records were found for {_scope_label(scope)}."
+
+    people = (
+        trackable.groupby("employee_key", observed=True)
+        .agg(
+            total_pm=("compliance_status", "size"),
+            on_time=("compliance_status", lambda x: int((x == "ON_TIME").sum())),
+            late=("compliance_status", lambda x: int((x == "LATE").sum())),
+            avg_days_late=("days_late", "mean"),
+            display_name=("done_by", _employee_display_name),
+        )
+        .reset_index()
+    )
+    people["on_time_pct"] = people.apply(lambda row: _safe_pct(row["on_time"], row["total_pm"]), axis=1)
+    people["avg_days_late"] = people["avg_days_late"].fillna(0).round(1)
+
+    matched_employee = _find_employee_match(question_text, people["employee_key"].tolist())
+    if matched_employee:
+        row = people[people["employee_key"] == matched_employee].iloc[0]
+        return (
+            f"{row['display_name']} has {int(row['total_pm']):,} trackable PM actions for {_scope_label(scope)}: "
+            f"{int(row['on_time']):,} on time and {int(row['late']):,} late. "
+            f"On-time rate is {row['on_time_pct']:.1f}%, with average delay {row['avg_days_late']:.1f} days. "
+            "This combines spelling and capitalization variants of the same name."
+        )
+
+    people = people[people["total_pm"] >= 10].copy()
+    if people.empty:
+        return "There are employee records, but no employee has at least 10 trackable PM actions in this scope."
+
+    strongest = people.sort_values(["on_time_pct", "total_pm"], ascending=[False, False]).head(3).reset_index(drop=True)
+    needs_support = people.sort_values(["on_time_pct", "late"], ascending=[True, False]).head(3).reset_index(drop=True)
+
+    strong_lines = _format_ranked_rows(
+        strongest,
+        "display_name",
+        [lambda r: f"{r['on_time_pct']:.1f}% on-time", lambda r: f"{int(r['total_pm']):,} PMs"],
+        limit=3,
+    )
+    support_lines = _format_ranked_rows(
+        needs_support,
+        "display_name",
+        [lambda r: f"{r['on_time_pct']:.1f}% on-time", lambda r: f"{int(r['late']):,} late PMs"],
+        limit=3,
+    )
+    return (
+        f"Employee PM effectiveness for {_scope_label(scope)}:\n"
+        f"Strong performers:\n{strong_lines}\n\n"
+        f"Needs support or workload review:\n{support_lines}\n\n"
+        "Safety note: treat this as an operational workload signal, not a disciplinary score, unless shift allocation, task difficulty, and data quality are reviewed."
+    )
+
+
+def _scope_brief_answer(pm_df, fail_df, scope):
+    scoped_pm = _apply_scope(pm_df, scope)
+    scoped_fail = _apply_scope(fail_df, scope)
+    if scoped_pm.empty and scoped_fail.empty:
+        return f"I found {_scope_label(scope)}, but there is not enough PM or failure data loaded for that scope."
+
+    pm_summary = (
+        compute_compliance_summary(scoped_pm)
+        if not scoped_pm.empty
+        else {"total_pm": 0, "compliance_pct": 0.0, "late": 0, "avg_days_late": 0.0}
+    )
+    fail_summary = (
+        compute_failure_summary(scoped_fail)
+        if not scoped_fail.empty
+        else {"total_failures": 0, "unique_assets": 0, "avg_resolution_hours": 0.0}
+    )
+
+    top_failure_text = "No failure mode is available."
+    if not scoped_fail.empty and "error_description" in scoped_fail.columns:
+        top_modes = scoped_fail["error_description"].fillna("UNKNOWN").value_counts().head(3)
+        if not top_modes.empty:
+            top_failure_text = ", ".join(f"{name} ({count:,})" for name, count in top_modes.items())
+
+    return (
+        f"For {_scope_label(scope)}: PM compliance is {pm_summary['compliance_pct']:.1f}% "
+        f"across {pm_summary['total_pm']:,} trackable PMs, with {pm_summary.get('late', 0):,} late PMs. "
+        f"There are {fail_summary['total_failures']:,} failures across {fail_summary['unique_assets']:,} assets, "
+        f"with average resolution time of {fail_summary['avg_resolution_hours']:.1f} hours. "
+        f"Top failure modes: {top_failure_text}."
+    )
+
+
+def _suggest_known_value(question_text, pm_df, fail_df):
+    stop_words = {
+        "WHAT",
+        "ABOUT",
+        "WHICH",
+        "SHOW",
+        "TELL",
+        "GIVE",
+        "BRIEF",
+        "SUMMARY",
+        "FAILURE",
+        "FAILURES",
+        "COMPLIANCE",
+        "STATION",
+        "SYSTEM",
+        "SUBSYSTEM",
+        "THE",
+        "FOR",
+        "IS",
+        "ARE",
+        "AND",
+    }
+    tokens = [
+        token
+        for token in re.findall(r"[A-Z0-9]{3,}", question_text.upper())
+        if token not in stop_words
+    ]
+    if not tokens:
+        return None
+
+    candidates = []
+    for col in ["station", "section", "system", "subsystem"]:
+        values = set()
+        if col in pm_df.columns:
+            values.update(str(v).upper() for v in pm_df[col].dropna().unique())
+        if col in fail_df.columns:
+            values.update(str(v).upper() for v in fail_df[col].dropna().unique())
+        candidates.extend((value, col) for value in values if value)
+
+    candidate_values = sorted({value for value, _ in candidates})
+    for token in tokens:
+        matches = difflib.get_close_matches(token, candidate_values, n=1, cutoff=0.74)
+        if matches and matches[0] != token:
+            match = matches[0]
+            match_col = next((col for value, col in candidates if value == match), "item")
+            return token, match_col, match
+    return None
+
+
+def _month_name(month_num):
+    months = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+    return months[month_num - 1] if month_num else None
+
+
+def _collect_valid_values(*dfs, column):
+    values = set()
+    for df in dfs:
+        if df is not None and not df.empty and column in df.columns:
+            values.update(str(value).upper() for value in df[column].dropna().unique())
+    return sorted(values)
+
+
+def resolve_context(current_entities, chat_history):
+    resolved = dict(current_entities or {})
+    for turn in reversed(chat_history or []):
+        previous = turn.get("entities") or {}
+        for key in ["station", "subsystem", "year", "month", "equipment"]:
+            if resolved.get(key) is None and previous.get(key) is not None:
+                resolved[key] = previous[key]
+        if resolved.get("comparison_targets") in (None, []):
+            previous_targets = previous.get("comparison_targets")
+            if previous_targets:
+                resolved["comparison_targets"] = previous_targets
+        if resolved.get("station") and resolved.get("subsystem"):
+            break
+    return resolved
+
+
+def _entities_to_scope(entities):
+    return {
+        "station": entities.get("station"),
+        "section": None,
+        "system": None,
+        "subsystem": entities.get("subsystem"),
+    }
+
+
+def _with_time_filters(pm_df, fail_df, entities):
+    month_name = _month_name(entities.get("month"))
+    year = str(entities["year"]) if entities.get("year") else None
+    station = entities.get("station")
+    subsystem = entities.get("subsystem")
+    pm_slice = (
+        filter_records(pm_df, station=station, subsystem=subsystem, year=year, month=month_name)
+        if pm_df is not None and not pm_df.empty
+        else pd.DataFrame()
+    )
+    fail_slice = (
+        filter_failure_events(fail_df, station=station, subsystem=subsystem, year=year, month=month_name)
+        if fail_df is not None and not fail_df.empty
+        else pd.DataFrame()
+    )
+    return pm_slice, fail_slice
+
+
+def _unknown_answer():
+    return (
+        "I can only answer questions grounded in this DMRC maintenance dashboard. "
+        "Try asking about PM compliance, late PMs, failures, maintenance-gap failures, urgent stations, trends, or a station/subsystem summary."
+    )
+
+
+def _trend_answer(pm_df, fail_df, entities):
+    month_name = _month_name(entities.get("month"))
+    year = str(entities["year"]) if entities.get("year") else None
+    relation = build_pm_failure_monthly(
+        pm_df,
+        fail_df,
+        station=entities.get("station"),
+        subsystem=entities.get("subsystem"),
+    )
+    if relation.empty:
+        return "No trend data available for that scope.", None
+    relation["month_dt"] = pd.to_datetime(relation["month"])
+    if year:
+        relation = relation[relation["month_dt"].dt.year == int(year)]
+    if month_name:
+        relation = relation[relation["month_dt"].dt.month == entities["month"]]
+    if relation.empty:
+        return "No trend data available for that time period.", None
+
+    weakest_pm = relation.sort_values("compliance_pct", ascending=True).iloc[0]
+    peak_failures = relation.sort_values("failure_count", ascending=False).iloc[0]
+    answer = (
+        f"Trend for {_scope_label(_entities_to_scope(entities))}: weakest PM month was {weakest_pm['month']} "
+        f"at {weakest_pm['compliance_pct']:.1f}% compliance across {int(weakest_pm['total_pm']):,} PMs. "
+        f"Peak failure month was {peak_failures['month']} with {int(peak_failures['failure_count']):,} failures."
+    )
+    chart_data = {
+        "type": "pm_failure_monthly",
+        "rows": relation[["month", "compliance_pct", "failure_count", "total_pm"]].to_dict("records"),
+    }
+    return answer, chart_data
+
+
+def _comparison_answer(pm_df, fail_df, entities):
+    targets = entities.get("comparison_targets") or []
+    if len(targets) < 2:
+        return "I need two valid stations or two valid subsystems to compare.", None
+
+    target_type = "station" if all(target in set(pm_df.get("station", pd.Series(dtype="string")).dropna().astype(str).str.upper()) for target in targets[:2]) else "subsystem"
+    rows = []
+    for target in targets[:2]:
+        scope = {"station": None, "section": None, "system": None, "subsystem": None}
+        scope[target_type] = target
+        pm_summary = compute_compliance_summary(_apply_scope(pm_df, scope))
+        fail_summary = compute_failure_summary(_apply_scope(fail_df, scope)) if fail_df is not None and not fail_df.empty else {
+            "total_failures": 0,
+            "avg_resolution_hours": 0.0,
+            "unique_assets": 0,
+        }
+        rows.append((target, pm_summary, fail_summary))
+
+    answer_lines = [
+        f"{target}: PM compliance {pm['compliance_pct']:.1f}% across {pm['total_pm']:,} PMs, "
+        f"{fail['total_failures']:,} failures, avg resolution {fail['avg_resolution_hours']:.1f} hours."
+        for target, pm, fail in rows
+    ]
+    return "Comparison:\n" + "\n".join(answer_lines), {
+        "type": "comparison",
+        "target_type": target_type,
+        "rows": [
+            {
+                "target": target,
+                "compliance_pct": pm["compliance_pct"],
+                "total_pm": pm["total_pm"],
+                "total_failures": fail["total_failures"],
+            }
+            for target, pm, fail in rows
+        ],
+    }
+
+
+def _make_answer_result(answer, data_used, intent_info, entities, chart_data=None):
+    return {
+        "answer": answer,
+        "data_used": data_used,
+        "intent": intent_info["intent"],
+        "entities": entities,
+        "confidence": intent_info.get("confidence", 0.0),
+        "chart_data": chart_data,
+        "is_safe": intent_info.get("is_safe", True),
+        "rejection_reason": intent_info.get("rejection_reason"),
+    }
+
+
+def answer_operations_question(
+    user_input,
+    pm_df,
+    pm_agg_df=None,
+    failure_df=None,
+    classified_df=None,
+    chat_history=None,
+    classified_failure_df=None,
+):
+    """
+    Data-grounded assistant for operational PM, failure, and employee-effectiveness questions.
+    """
+    if classified_df is None and classified_failure_df is not None:
+        classified_df = classified_failure_df
+
+    q = (user_input or "").strip()
+    if not q:
+        intent_info = {"intent": "unknown", "confidence": 0.2, "is_safe": True, "rejection_reason": None}
+        return _make_answer_result(_unknown_answer(), "none", intent_info, {})
+
+    is_safe, rejection_reason = security_filter(q)
+    if not is_safe:
+        intent_info = {
+            "intent": "unknown",
+            "confidence": 1.0,
+            "is_safe": False,
+            "rejection_reason": rejection_reason,
+            "entities": {},
+        }
+        return _make_answer_result(rejection_reason, "security_filter", intent_info, {})
+
+    pm_df = pm_df if pm_df is not None else pd.DataFrame()
+    fail_df = failure_df if failure_df is not None else pd.DataFrame()
+    agg_df = pm_agg_df if pm_agg_df is not None else pd.DataFrame()
+    valid_stations = _collect_valid_values(pm_df, agg_df, fail_df, column="station")
+    valid_subsystems = _collect_valid_values(pm_df, agg_df, fail_df, column="subsystem")
+    intent_info = classify_intent(q, valid_stations=valid_stations, valid_subsystems=valid_subsystems)
+    employee_keys = []
+    if not pm_df.empty and "done_by" in pm_df.columns:
+        employee_keys = sorted({_employee_key(value) for value in pm_df["done_by"].dropna().unique() if _employee_key(value)})
+    if _find_employee_match(q, employee_keys):
+        intent_info["intent"] = "employee_query"
+        intent_info["confidence"] = max(intent_info.get("confidence", 0.0), 0.88)
+
+    if not intent_info["is_safe"]:
+        return _make_answer_result(
+            intent_info["rejection_reason"],
+            "security_filter",
+            intent_info,
+            intent_info.get("entities", {}),
+        )
+
+    entities = resolve_context(intent_info.get("entities", {}), chat_history)
+    scope = _entities_to_scope(entities)
+    intent = intent_info["intent"]
+
+    if intent == "unknown":
+        return _make_answer_result(_unknown_answer(), "intent_classifier", intent_info, entities)
+
+    if intent == "urgent_query":
+        return _make_answer_result(_urgent_station_answer(pm_df, fail_df), "pm_df + failure_df station risk", intent_info, entities)
+
+    if intent == "employee_query":
+        return _make_answer_result(_employee_effectiveness_answer(pm_df, scope, q), "pm_df done_by", intent_info, entities)
+
+    if intent == "failure_classification_query":
+        return _make_answer_result(_maintenance_gap_answer(classified_df, scope), "classified_df failure_label", intent_info, entities)
+
+    if intent == "comparison_query":
+        answer, chart_data = _comparison_answer(pm_df, fail_df, entities)
+        return _make_answer_result(answer, "pm_df + failure_df comparison", intent_info, entities, chart_data)
+
+    if intent == "trend_query":
+        answer, chart_data = _trend_answer(pm_df, fail_df, entities)
+        return _make_answer_result(answer, "monthly PM/failure trend", intent_info, entities, chart_data)
+
+    if intent == "failure_query":
+        scoped_pm, scoped_fail = _with_time_filters(pm_df, fail_df, entities)
+        scope_for_label = _entities_to_scope(entities)
         if scoped_fail.empty:
-            return "No failures were found in the requested scope."
-        top = scoped_fail["error_description"].fillna("UNKNOWN").value_counts().head(3)
-        parts = [f"{idx} ({val:,})" for idx, val in top.items()]
-        return "Top failure modes are: " + ", ".join(parts) + "."
+            answer = f"No failures were found for {_scope_label(scope_for_label)}."
+        elif "failure mode" in q.lower() or "top" in q.lower() or "most" in q.lower():
+            top = scoped_fail["error_description"].fillna("UNKNOWN").value_counts().head(3)
+            parts = [f"{idx} ({val:,})" for idx, val in top.items()]
+            answer = "Top failure modes are: " + ", ".join(parts) + "."
+        else:
+            fail_summary = compute_failure_summary(scoped_fail)
+            answer = (
+                f"There were {fail_summary['total_failures']:,} failures for {_scope_label(scope_for_label)}, "
+                f"across {fail_summary['unique_assets']:,} assets, with average resolution time "
+                f"{fail_summary['avg_resolution_hours']:.1f} hours."
+            )
+        return _make_answer_result(answer, "failure_df", intent_info, entities)
 
-    if "WHICH SUBSYSTEM" in q_norm or "MOST FAILURE-PRONE" in q_norm:
-        if scoped_fail.empty:
-            return "No failures were found in the requested scope."
-        top = scoped_fail["subsystem"].value_counts().head(1)
-        return f"The most failure-prone subsystem is {top.index[0]} with {int(top.iloc[0]):,} failures."
+    if intent == "compliance_query":
+        scoped_pm, _ = _with_time_filters(pm_df, fail_df, entities)
+        pm_summary = compute_compliance_summary(scoped_pm) if not scoped_pm.empty else {"compliance_pct": 0.0, "total_pm": 0, "late": 0}
+        answer = (
+            f"PM compliance is {pm_summary['compliance_pct']:.1f}% across "
+            f"{pm_summary['total_pm']:,} trackable PM actions for {_scope_label(scope)}. "
+            f"Late PM count is {pm_summary.get('late', 0):,}."
+        )
+        return _make_answer_result(answer, "pm_df compliance_status", intent_info, entities)
 
-    return "I can answer count-style questions about failures, PM actions, compliance, and top failure modes by station, section, system, or subsystem."
+    if intent == "station_query" or intent == "subsystem_query" or intent == "summary_query":
+        return _make_answer_result(_scope_brief_answer(pm_df, fail_df, scope), "pm_df + failure_df summary", intent_info, entities)
+
+    return _make_answer_result(_unknown_answer(), "intent_classifier", intent_info, entities)
