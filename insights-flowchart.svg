@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1380" viewBox="0 0 1800 1380">
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .box { fill: #ffffff; stroke: #163f66; stroke-width: 3; rx: 18; ry: 18; }
+      .rule { fill: #fff8e8; stroke: #b58400; stroke-width: 3; rx: 18; ry: 18; }
+      .out { fill: #eef6ff; stroke: #1c5fa8; stroke-width: 3; rx: 18; ry: 18; }
+      .text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 24px; fill: #1b1f24; }
+      .small { font-size: 22px; }
+      .title { font-size: 28px; font-weight: 700; }
+      .arrow { stroke: #425466; stroke-width: 4; fill: none; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <polygon points="0 0, 12 6, 0 12" fill="#425466"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1380"/>
+
+  <rect class="box" x="90" y="70" width="420" height="120"/>
+  <text class="text title" x="300" y="118" text-anchor="middle">PM data</text>
+  <text class="text" x="300" y="158" text-anchor="middle">pm_compliance_agg.csv</text>
+
+  <rect class="box" x="1290" y="70" width="420" height="120"/>
+  <text class="text title" x="1500" y="118" text-anchor="middle">Failure data</text>
+  <text class="text" x="1500" y="158" text-anchor="middle">css.csv + errors.csv</text>
+
+  <rect class="box" x="90" y="280" width="420" height="120"/>
+  <text class="text title" x="300" y="328" text-anchor="middle">app.py loads</text>
+  <text class="text" x="300" y="368" text-anchor="middle">agg_df</text>
+
+  <rect class="box" x="1290" y="280" width="420" height="120"/>
+  <text class="text title" x="1500" y="320" text-anchor="middle">failure_pipeline builds</text>
+  <text class="text" x="1500" y="360" text-anchor="middle">failure_summary_df</text>
+
+  <rect class="out" x="570" y="500" width="660" height="120"/>
+  <text class="text title" x="900" y="548" text-anchor="middle">Insights tab calls</text>
+  <text class="text" x="900" y="588" text-anchor="middle">generate_insights(agg_df, failure_summary_df)</text>
+
+  <rect class="rule" x="90" y="760" width="460" height="90"/>
+  <text class="text small" x="320" y="815" text-anchor="middle">Rule 1: any subsystem compliance &lt; 50%?</text>
+
+  <rect class="rule" x="670" y="760" width="460" height="90"/>
+  <text class="text small" x="900" y="815" text-anchor="middle">Rule 2: overall PM compliance &lt; 70%?</text>
+
+  <rect class="rule" x="1250" y="760" width="460" height="90"/>
+  <text class="text small" x="1480" y="815" text-anchor="middle">Rule 3: maintenance-gap failures &gt; 40%?</text>
+
+  <rect class="rule" x="90" y="920" width="460" height="90"/>
+  <text class="text small" x="320" y="975" text-anchor="middle">Rule 4: highest-failure station warning</text>
+
+  <rect class="rule" x="670" y="920" width="460" height="90"/>
+  <text class="text small" x="900" y="975" text-anchor="middle">Rule 5: avg resolution hours &gt; 4?</text>
+
+  <rect class="rule" x="1250" y="920" width="460" height="90"/>
+  <text class="text small" x="1480" y="975" text-anchor="middle">Rule 6: best subsystem compliance &gt; 85%?</text>
+
+  <rect class="rule" x="670" y="1080" width="460" height="90"/>
+  <text class="text small" x="900" y="1135" text-anchor="middle">Rule 7: equipment-failure share &gt; 30%?</text>
+
+  <rect class="out" x="570" y="1230" width="660" height="70"/>
+  <text class="text" x="900" y="1273" text-anchor="middle">Create English insight dict → sort by priority → render colored cards</text>
+
+  <path class="arrow" d="M300 190 L300 280"/>
+  <path class="arrow" d="M1500 190 L1500 280"/>
+  <path class="arrow" d="M510 340 L570 560"/>
+  <path class="arrow" d="M1290 340 L1230 560"/>
+
+  <path class="arrow" d="M900 620 L320 760"/>
+  <path class="arrow" d="M900 620 L900 760"/>
+  <path class="arrow" d="M900 620 L1480 760"/>
+  <path class="arrow" d="M900 620 L320 920"/>
+  <path class="arrow" d="M900 620 L900 920"/>
+  <path class="arrow" d="M900 620 L1480 920"/>
+  <path class="arrow" d="M900 620 L900 1080"/>
+
+  <path class="arrow" d="M320 850 L900 1230"/>
+  <path class="arrow" d="M900 850 L900 1230"/>
+  <path class="arrow" d="M1480 850 L900 1230"/>
+  <path class="arrow" d="M320 1010 L900 1230"/>
+  <path class="arrow" d="M900 1010 L900 1230"/>
+  <path class="arrow" d="M1480 1010 L900 1230"/>
+  <path class="arrow" d="M900 1170 L900 1230"/>
+</svg>
