@@ -42,6 +42,7 @@ def _failure_df():
             "resolution_hours": [2.0, 4.0],
             "equipment_no": ["EQ1", "EQ2"],
             "error_description": ["Video Loss", "Gate Error"],
+            "failure_category": ["CCTV", "AFC"],
             "failure_date": pd.to_datetime(["2025-01-10", "2025-02-10"]),
             "month": ["2025-01", "2025-02"],
         }
@@ -130,3 +131,26 @@ def test_employee_name_variants_are_combined_for_named_query():
     assert result["intent"] == "employee_query"
     assert "4 trackable PM actions" in result["answer"]
     assert "2 on time and 2 late" in result["answer"]
+
+
+def test_failure_reason_query_uses_failure_reason_columns():
+    result = pipeline.answer_operations_question(
+        "reason of failure in whole network",
+        _pm_df(),
+        _agg_df(),
+        failure_df=_failure_df(),
+    )
+    assert result["intent"] == "failure_query"
+    assert result["data_used"] == "failure_df from css.csv + errors.csv"
+    assert "Top failure reasons" in result["answer"]
+    assert "Video Loss" in result["answer"]
+    assert "average resolution" not in result["answer"].lower()
+
+
+def test_whole_network_does_not_fuzzy_match_networking_subsystem():
+    classified = classify_intent(
+        "reason of failure in whole network",
+        valid_stations=["ATHA", "NDRU"],
+        valid_subsystems=["NETWORKING", "CCTV"],
+    )
+    assert classified["entities"]["subsystem"] is None

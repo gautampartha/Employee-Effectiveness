@@ -190,6 +190,9 @@ def _fuzzy_match_token(text_upper: str, candidates: list[str], min_score: int = 
 def extract_entities(user_input: str, valid_stations: list, valid_subsystems: list) -> dict:
     text = user_input or ""
     text_upper = text.upper()
+    whole_network_scope = bool(
+        re.search(r"\b(?:WHOLE|FULL|ENTIRE|ALL)\s+NETWORK\b|\bNETWORK[- ]WIDE\b", text_upper)
+    )
     stations = _clean_values(valid_stations)
     subsystems = _clean_values(valid_subsystems)
 
@@ -197,7 +200,10 @@ def extract_entities(user_input: str, valid_stations: list, valid_subsystems: li
     subsystem_matches = _exact_matches(text_upper, subsystems)
 
     station = station_matches[0] if station_matches else _fuzzy_match_token(text_upper, stations)
-    subsystem = subsystem_matches[0] if subsystem_matches else _fuzzy_match_token(text_upper, subsystems)
+    if whole_network_scope:
+        subsystem = None
+    else:
+        subsystem = subsystem_matches[0] if subsystem_matches else _fuzzy_match_token(text_upper, subsystems)
 
     year_match = re.search(r"\b(20\d{2}|19\d{2})\b", text_upper)
     year = int(year_match.group(1)) if year_match else None

@@ -345,9 +345,17 @@ def load_failure_events(filepath, lookup_path, pm_date_range=None):
 
     css_df["mapping_confidence"] = "LOOKUP_ONLY"
     exact_match = css_df["subsystem"] == css_df["mapped_eqp_type_norm"]
-    family_match = (
-        css_df["subsystem"].fillna("").str.contains(css_df["mapped_eqp_type_norm"].fillna(""), regex=False)
-        | css_df["mapped_eqp_type_norm"].fillna("").str.contains(css_df["subsystem"].fillna(""), regex=False)
+    # pandas string accessors accept one pattern, not a different pattern for
+    # every row. Compare the two normalized labels pairwise instead.
+    family_match = pd.Series(
+        [
+            bool(subsystem and mapped_type and (mapped_type in subsystem or subsystem in mapped_type))
+            for subsystem, mapped_type in zip(
+                css_df["subsystem"].fillna(""),
+                css_df["mapped_eqp_type_norm"].fillna(""),
+            )
+        ],
+        index=css_df.index,
     )
     system_level_match = (
         ((css_df["mapped_eqp_type_norm"] == "ALL AFC") & (css_df["system"] == "AFC"))
@@ -651,41 +659,29 @@ def build_equipment_pm_failure_links(records_df, failure_df, station=None, syste
 
     pm_slice = pm_slice[pm_slice["eqkey"].isin(common_keys)].copy()
     fail_slice = fail_slice[fail_slice["eqkey"].isin(common_keys)].copy()
-    fail_slice = fail_slice.sort_values(["eqkey", "failure_event_at"])
-
-    linked_parts = []
-    for eqkey, pm_group in pm_slice.groupby("eqkey", observed=True):
-        fail_group = fail_slice[fail_slice["eqkey"] == eqkey]
-        if fail_group.empty:
-            continue
-        pm_group = pm_group.sort_values("done_date").copy()
-        linked = pd.merge_asof(
-            pm_group,
-            fail_group[
-                [
-                    "failure_event_at",
-                    "equipment_no",
-                    "error_description",
-                    "failure_category",
-                    "attended_by_display",
-                    "resolution_hours",
-                    "station",
-                    "section",
-                    "system",
-                    "subsystem",
-                    "eqkey",
-                ]
-            ].sort_values("failure_event_at"),
-            left_on="done_date",
-            right_on="failure_event_at",
-            direction="forward",
-        )
-        linked_parts.append(linked)
-
-    if not linked_parts:
-        return pd.DataFrame()
-
-    linked_df = pd.concat(linked_parts, ignore_index=True)
+    failure_cols = [
+        "eqkey",
+        "failure_event_at",
+        "equipment_no",
+        "error_description",
+        "failure_category",
+        "attended_by_display",
+        "resolution_hours",
+        "station",
+        "section",
+        "system",
+        "subsystem",
+    ]
+    # A single grouped as-of join replaces one full failure-log scan per
+    # equipment ID. This keeps the detailed view responsive for large CSS logs.
+    linked_df = pd.merge_asof(
+        pm_slice.sort_values(["done_date", "eqkey"]),
+        fail_slice[failure_cols].sort_values(["failure_event_at", "eqkey"]),
+        left_on="done_date",
+        right_on="failure_event_at",
+        by="eqkey",
+        direction="forward",
+    )
     linked_df["days_to_next_failure"] = (
         linked_df["failure_event_at"] - linked_df["done_date"]
     ).dt.total_seconds() / 86400.0
@@ -1006,6 +1002,87 @@ def _maintenance_gap_answer(classified_failure_df, scope):
         f"({_safe_pct(gap, total):.1f}%). Equipment-side failures are {equipment:,} "
         f"({_safe_pct(equipment, total):.1f}%), and {no_pm:,} failures have no prior PM record "
         f"({_safe_pct(no_pm, total):.1f}%)."
+    )
+
+
+FAILURE_REASON_TERMS = (
+    "reason",
+    "reasons",
+    "cause",
+    "causes",
+    "why",
+    "failure mode",
+    "failure modes",
+    "fault type",
+    "error",
+    "errors",
+    "category",
+    "categories",
+)
+
+FAILURE_RESOLUTION_TERMS = (
+    "resolution",
+    "resolve",
+    "resolved",
+    "repair time",
+    "downtime",
+    "duration",
+    "hours",
+)
+
+
+def _is_failure_reason_question(question_text):
+    q_lower = (question_text or "").lower()
+    return any(term in q_lower for term in FAILURE_REASON_TERMS) or "top" in q_lower or "most" in q_lower
+
+
+def _is_failure_resolution_question(question_text):
+    q_lower = (question_text or "").lower()
+    return any(term in q_lower for term in FAILURE_RESOLUTION_TERMS)
+
+
+def _failure_reason_answer(fail_df, scope, limit=5):
+    scoped_fail = _apply_scope(fail_df, scope)
+    if scoped_fail.empty:
+        return f"No failures were found for {_scope_label(scope)}."
+    if "error_description" not in scoped_fail.columns:
+        return "Failure records are loaded, but the error-description lookup is not available."
+
+    total = len(scoped_fail)
+    reasons = (
+        scoped_fail["error_description"]
+        .fillna("UNKNOWN")
+        .astype("string")
+        .str.strip()
+        .replace("", "UNKNOWN")
+        .value_counts()
+        .head(limit)
+    )
+    reason_text = ", ".join(
+        f"{reason} ({count:,}, {_safe_pct(count, total):.1f}%)"
+        for reason, count in reasons.items()
+    )
+
+    category_text = ""
+    if "failure_category" in scoped_fail.columns:
+        categories = (
+            scoped_fail["failure_category"]
+            .fillna("UNKNOWN")
+            .astype("string")
+            .str.strip()
+            .replace("", "UNKNOWN")
+            .value_counts()
+            .head(3)
+        )
+        if not categories.empty:
+            category_text = " Main categories: " + ", ".join(
+                f"{category} ({count:,}, {_safe_pct(count, total):.1f}%)"
+                for category, count in categories.items()
+            ) + "."
+
+    return (
+        f"Top failure reasons for {_scope_label(scope)} are: {reason_text}."
+        f"{category_text}"
     )
 
 
@@ -1397,10 +1474,15 @@ def answer_operations_question(
         scope_for_label = _entities_to_scope(entities)
         if scoped_fail.empty:
             answer = f"No failures were found for {_scope_label(scope_for_label)}."
-        elif "failure mode" in q.lower() or "top" in q.lower() or "most" in q.lower():
-            top = scoped_fail["error_description"].fillna("UNKNOWN").value_counts().head(3)
-            parts = [f"{idx} ({val:,})" for idx, val in top.items()]
-            answer = "Top failure modes are: " + ", ".join(parts) + "."
+        elif _is_failure_reason_question(q):
+            answer = _failure_reason_answer(scoped_fail, scope_for_label)
+        elif _is_failure_resolution_question(q):
+            fail_summary = compute_failure_summary(scoped_fail)
+            answer = (
+                f"Average resolution time for {_scope_label(scope_for_label)} is "
+                f"{fail_summary['avg_resolution_hours']:.1f} hours across "
+                f"{fail_summary['total_failures']:,} failures."
+            )
         else:
             fail_summary = compute_failure_summary(scoped_fail)
             answer = (
@@ -1408,7 +1490,7 @@ def answer_operations_question(
                 f"across {fail_summary['unique_assets']:,} assets, with average resolution time "
                 f"{fail_summary['avg_resolution_hours']:.1f} hours."
             )
-        return _make_answer_result(answer, "failure_df", intent_info, entities)
+        return _make_answer_result(answer, "failure_df from css.csv + errors.csv", intent_info, entities)
 
     if intent == "compliance_query":
         scoped_pm, _ = _with_time_filters(pm_df, fail_df, entities)
